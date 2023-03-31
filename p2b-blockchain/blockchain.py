@@ -47,7 +47,7 @@ class Block(object):
     def _hash(self):
         return hashlib.sha256(
             str(self.number).encode('utf-8') +
-            str(self.transactions).encode('utf-8') +
+            str([str(txn) for txn in self.transactions]).encode('utf-8') +
             str(self.previous_hash).encode('utf-8') +
             str(self.miner).encode('utf-8')
         ).hexdigest()
@@ -70,24 +70,33 @@ class State(object):
         # TODO: You might want to think how you will store balance per person.
         # You don't need to worry about persisting to disk. Storing in memory is fine.
         self.balance = {}
+        self.history_log = {}
 
     def encode(self):
         dumped = {}
         # TODO: Add all person -> balance pairs into `dumped`.
         for (k, v) in self.balance.items():
-            dumped[k] = str(v)
+            dumped[k] = v
         return dumped
 
-    def is_valid_txn(self, txn):
-        if txn.sender not in self.balance: return False
-        if txn.amount > self.balance[txn.sender]: return False
+    def is_valid_txn(self, txn, curr_state):
+        if txn.sender not in curr_state: return False
+        if txn.amount > curr_state[txn.sender]: return False
         return True
 
-    def apply_txn(self, txn, tmp_state):
+    def apply_txn(self, txn, tmp_state, block_log={}):
         tmp_state[txn.sender] -= txn.amount
         if txn.recipient not in tmp_state:
             tmp_state[txn.recipient] = txn.amount
-        return tmp_state
+        else:
+            tmp_state[txn.recipient] += txn.amount
+
+        if txn.sender not in block_log: block_log[txn.sender] = -txn.amount
+        else: block_log[txn.sender] -= txn.amount
+        if txn.recipient not in block_log: block_log[txn.recipient] = txn.amount
+        else: block_log[txn.recipient] += txn.amount
+
+        return tmp_state, block_log
 
     def validate_txns(self, txns):
         result = []
@@ -97,25 +106,45 @@ class State(object):
         tmp_state = self.balance.copy()
         for txn in txns:
             if self.is_valid_txn(txn, tmp_state):
-                tmp_state = self.apply_txn(txn, tmp_state)
+                tmp_state, _ = self.apply_txn(txn, tmp_state)
                 result.append(txn)
 
         print("Initial transactions: ", txns)
         print("Valid transactions: ", result)
         print("Initial state: ", self.encode())
         print("Final state: ", tmp_state)
-        
+        print("Result len: %d" % len(result))
         return result
 
     def apply_block(self, block):
+        # No need to apply genesis block
+        if block.number == 1: return
+
         # TODO: apply the block to the state.
         valid_txns = self.validate_txns(block.transactions)
         assert len(valid_txns) == len(block.transactions) # TODO: make sure if this is correct
 
+        block_log = {}
         for txn in block.transactions:
-            self.balance = self.apply_txn(txn, self.balance)
+            self.balance, block_log = self.apply_txn(txn, self.balance, block_log)
+        
+        self.history_log[block.number] = block_log
 
         logging.info("Block (#%s) applied to state. %d transactions applied" % (block.hash, len(block.transactions)))
+    
+    def history(self, account):
+        # TODO: return a list of (blockNumber, value changes) that this account went through
+        
+        # Iterate over blocks, and check if this account was involved in any transaction.
+        # Add up all the value changes and get the final change for the block
+        history = []
+
+        for (block_num, block_log) in self.history_log.items():
+            if account in block_log:
+                history.append([block_num, block_log[account]])
+        print(history)
+
+        return history
 
 class Blockchain(object):
     def __init__(self):
@@ -161,13 +190,17 @@ class Blockchain(object):
         #2
         if len(self.chain) > 0 and block.previous_hash != previous_block.hash:
             return False
+        if len(self.chain) == 0 and block.previous_hash != '0xfeedcafe':
+            return False
         
         #3
         if len(valid_txns) != len(block.transactions):
             return False
 
         #4
-        if len(self.chain) > 0 and block.number != previous_block.number + 1:
+        if len(self.chain) > 0 and (block.number != previous_block.number + 1):
+            return False
+        if len(self.chain) == 0 and (block.number != 1):
             return False
        
         #5
@@ -205,6 +238,12 @@ class Blockchain(object):
              
         # TODO: make changes to in-memory data structures to reflect the new block. Check Blockchain.__init__ method for in-memory datastructures
         self.chain.append(block)
+        if genesis:
+            # TODO: at time of genesis, change state to have 'A': 10000 (person A has 10000)
+            self.state.balance['A'] = 10000
+            self.state.history_log[1] = {'A': 10000}
+            print("Initializing state and history in-memory data structures")
+        
         self.current_transactions = [txn for txn in self.current_transactions if txn not in valid_txns]
         self.state.apply_block(block)
 
@@ -220,6 +259,6 @@ class Blockchain(object):
         """
         # TODO: check that transaction is unique.
         new_txn = Transaction(sender, recipient, amount)
-        txn_eq_to_new = [t for t in self.current_transactions if t == new_txn]
-        if len(txn_eq_to_new) > 0: return
         self.current_transactions.append(new_txn)
+        
+        print("Txns: ", self.current_transactions)

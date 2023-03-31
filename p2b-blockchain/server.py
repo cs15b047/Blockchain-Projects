@@ -28,6 +28,12 @@ def new_block_received():
 
     blockchain.chain.append(block)    # Add the block to the chain
     # Modify any other in-memory data structures to reflect the new block
+    # After receiving genesis block, set state to A:10000
+    if block.number == 1:
+        blockchain.state.balance['A'] = 10000
+        blockchain.state.history_log[1] = {'A': 10000}
+    else:
+        blockchain.state.apply_block(block)
 
     # TODO: if I am responsible for next block, start mining it (trigger_new_block_mine).
     max_node_id, min_node_id = max(blockchain.nodes), min(blockchain.nodes)
@@ -64,6 +70,7 @@ def full_chain():
 
 @app.route('/startexp/', methods=['GET'])
 def startexp():
+    print("Starting experiment with genesis block")
     if blockchain.node_identifier == min(blockchain.nodes):
         blockchain.trigger_new_block_mine(genesis=True)
     return 'OK'
@@ -71,6 +78,14 @@ def startexp():
 @app.route('/health', methods=['GET'])
 def health():
     return 'OK', 200
+
+@app.route('/history', methods=['GET'])
+def history():
+    account = request.args.get('account', '')
+    if account == '':
+        return 'Missing values', 400
+    data = blockchain.state.history(account)
+    return jsonify(data), 200
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
