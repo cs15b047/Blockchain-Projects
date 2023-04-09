@@ -5,25 +5,30 @@ import json
 import time
 import threading
 import logging
+import uuid
+import rsa
+import os
+from cryptography.fernet import Fernet
 
 import requests
 from flask import Flask, request
 
 class Transaction(object):
-    def __init__(self, sender, recipient, amount):
+    def __init__(self, sender, recipient, amount, data=""):
         self.sender = sender # constraint: should exist in state
         self.recipient = recipient # constraint: need not exist in state. Should exist in state if transaction is applied.
         self.amount = amount # constraint: sender should have enough balance to send this amount
+        self.data = data # Represents data shared from sender to recipient. Can be None.
 
     def __str__(self) -> str:
-        return "T(%s -> %s: %s)" % (self.sender, self.recipient, self.amount)
+        return "T(%s -> %s: %s, %s)" % (self.sender, self.recipient, self.amount, self.data)
 
     def encode(self) -> str:
         return self.__dict__.copy()
 
     @staticmethod
     def decode(data):
-        return Transaction(data['sender'], data['recipient'], data['amount'])
+        return Transaction(data['sender'], data['recipient'], data['amount'], data['data'])
 
     def __lt__(self, other):
         if self.sender < other.sender: return True
@@ -71,6 +76,12 @@ class State(object):
         # You don't need to worry about persisting to disk. Storing in memory is fine.
         self.balance = {}
         self.history_log = {}
+        self.data = {} # Dict from node id to data
+        self.public_keys = {} # Dict from node id to public key
+        self.symm_keys = {} # Dict from node id to symmetric key
+        self.private_key = None
+        self.id = None
+        self.dir = None
 
     def encode(self):
         dumped = {}
@@ -84,7 +95,46 @@ class State(object):
         if txn.amount > curr_state[txn.sender]: return False
         return True
 
-    def apply_txn(self, txn, tmp_state, block_log={}):
+    def save_data(self, data):
+        random_id = str(uuid.uuid4())
+        path = os.path.join(self.dir, random_id)
+
+        with open(path, 'w') as f:
+            f.write(data)
+        print("Saving file data to: ", path)
+
+    def handle_txn_data(self, txn, data, public_keys, symm_keys):
+        # Extract data out of txn
+        txn_data = txn.data
+        txn_data = json.loads(txn_data)
+        if not txn_data: return data, public_keys, symm_keys
+        print("Public keys: ", public_keys)
+        print("Symmetric keys: ", symm_keys)
+
+        if txn.sender not in public_keys and 'pub_key' in txn_data:
+            public_keys[txn.sender] = rsa.PublicKey.load_pkcs1(txn_data['pub_key'].encode('utf-8'))
+            print("Step #1: Received public key from: ", txn.sender)
+        
+        # Can decrypt symmetric key only if recipient is self
+        if self.id == int(txn.recipient) and 'symm_key' in txn_data:
+            sender_symm_key = rsa.decrypt(bytes.fromhex(txn_data['symm_key']), self.private_key)
+            symm_keys[txn.sender] = Fernet(sender_symm_key)
+            print("Step #2: Received symmetric key from: ", txn.sender)
+        
+        print("Sender: {txn.sender}, Symmetric keys: ", symm_keys)
+        # Can decrypt data only if recipient is self and symmetric key of sender is known
+        if self.id == int(txn.recipient) and 'data' in txn_data and txn.sender in symm_keys:
+            encrypted_data = txn_data['data']
+            # Convert string to bytes
+            encrypted_data = bytes(encrypted_data, 'utf-8')
+            print("Step #3: Received encrypted data from: ", txn.sender)
+            decoded_data = symm_keys[txn.sender].decrypt(encrypted_data).decode()
+            self.save_data(decoded_data)
+
+        return data, public_keys, symm_keys
+
+    def apply_txn(self, txn, tmp_state, block_log={}, data={}, public_keys={}, symm_keys={}):
+        print(txn)
         tmp_state[txn.sender] -= txn.amount
         if txn.recipient not in tmp_state:
             tmp_state[txn.recipient] = txn.amount
@@ -96,7 +146,8 @@ class State(object):
         if txn.recipient not in block_log: block_log[txn.recipient] = txn.amount
         else: block_log[txn.recipient] += txn.amount
 
-        return tmp_state, block_log
+        data, public_keys, symm_keys = self.handle_txn_data(txn, data, public_keys, symm_keys)
+        return tmp_state, block_log, data, public_keys, symm_keys
 
     def validate_txns(self, txns):
         result = []
@@ -104,9 +155,13 @@ class State(object):
         # You receive a list of transactions, and you try applying them to the state.
         # If a transaction can be applied, add it to result. (should be included)
         tmp_state = self.balance.copy()
+        data = self.data.copy()
+        pk = self.public_keys.copy()
+        sk = self.symm_keys.copy()
         for txn in txns:
             if self.is_valid_txn(txn, tmp_state):
-                tmp_state, _ = self.apply_txn(txn, tmp_state)
+                tmp_state, _, _, pk, sk = self.apply_txn(txn, tmp_state, {}, data, pk, sk)
+                print("Public keys modified: ", pk)
                 result.append(txn)
 
         print("Initial transactions: ", txns)
@@ -114,6 +169,9 @@ class State(object):
         print("Initial state: ", self.encode())
         print("Final state: ", tmp_state)
         print("Result len: %d" % len(result))
+        print("Data: ", data)
+        print("Public keys: ", pk)
+        print("Symmetric keys: ", sk)
         return result
 
     def apply_block(self, block):
@@ -126,7 +184,7 @@ class State(object):
 
         block_log = {}
         for txn in block.transactions:
-            self.balance, block_log = self.apply_txn(txn, self.balance, block_log)
+            self.balance, block_log, self.data, self.public_keys, self.symm_keys = self.apply_txn(txn, self.balance, block_log, self.data, self.public_keys, self.symm_keys)
         
         self.history_log[block.number] = block_log
 
@@ -239,9 +297,9 @@ class Blockchain(object):
         # TODO: make changes to in-memory data structures to reflect the new block. Check Blockchain.__init__ method for in-memory datastructures
         self.chain.append(block)
         if genesis:
-            # TODO: at time of genesis, change state to have 'A': 10000 (person A has 10000)
-            self.state.balance['A'] = 10000
-            self.state.history_log[1] = {'A': 10000}
+            # TODO: at time of genesis, change state to have '5001': 10000 (person 5001 has 10000)
+            self.state.balance['5001'] = 10000
+            self.state.history_log[1] = {'5001': 10000}
             print("Initializing state and history in-memory data structures")
         
         self.current_transactions = [txn for txn in self.current_transactions if txn not in valid_txns]
@@ -253,12 +311,12 @@ class Blockchain(object):
             if node == self.node_identifier: continue
             requests.post(f'http://localhost:{node}/inform/block', json=block.encode())
 
-    def new_transaction(self, sender, recipient, amount):
+    def new_transaction(self, sender, recipient, amount, data=""):
         """ Add this transaction to the transaction mempool. We will try
         to include this transaction in the next block until it succeeds.
         """
         # TODO: check that transaction is unique.
-        new_txn = Transaction(sender, recipient, amount)
+        new_txn = Transaction(sender, recipient, amount, data)
         self.current_transactions.append(new_txn)
         
         print("Txns: ", self.current_transactions)
